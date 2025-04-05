@@ -10,6 +10,8 @@ import 'package:http/http.dart';
 import 'package:web3dart/web3dart.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'constants/contract_constants.dart';
+import 'utils/document_metadata_extractor.dart';
+import 'package:intl/intl.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -80,7 +82,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   FilePickerResult? _selectedFile;
   String _fileHash = '';
-  String _metadataUrl = '';
+  DocumentMetadata? _documentMetadata;
+  
+  // Audit trail
+  List<Map<String, dynamic>> _auditTrail = [];
 
   @override
   void initState() {
@@ -237,35 +242,73 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         setState(() {
           _selectedFile = result;
           _fileHash = '';
+          _documentMetadata = null;
         });
 
-        // Compute file hash from bytes (works on all platforms including web)
-        Uint8List? fileBytes;
-
-        // Get file bytes directly from the result
-        if (result.files.single.bytes != null) {
-          // Web platform will use this branch
-          fileBytes = result.files.single.bytes!;
-        } else if (result.files.single.path != null) {
-          // Native platforms can use this as fallback
-          final file = File(result.files.single.path!);
-          fileBytes = await file.readAsBytes();
-        } else {
-          throw Exception('Could not read file content');
-        }
-
-        if (fileBytes != null) {
-          final digest = sha256.convert(fileBytes);
+        // Extract metadata from the file
+        try {
+          final metadata = await DocumentMetadataExtractor.extractMetadata(result);
           setState(() {
-            _fileHash = '0x${digest.toString()}';
+            _documentMetadata = metadata;
+            _fileHash = metadata.hash;
           });
+          
+          // Add to audit trail
+          _addToAuditTrail('FILE_SELECTED', {
+            'fileName': metadata.fileName,
+            'fileType': metadata.fileType,
+            'fileSize': metadata.fileSize,
+            'hash': metadata.hash
+          });
+        } catch (e) {
+          // Fallback to just computing the hash if metadata extraction fails
+          // Get file bytes directly from the result
+          Uint8List? fileBytes;
+          if (result.files.single.bytes != null) {
+            fileBytes = result.files.single.bytes!;
+          } else if (result.files.single.path != null) {
+            final file = File(result.files.single.path!);
+            fileBytes = await file.readAsBytes();
+          } else {
+            throw Exception('Could not read file content');
+          }
+
+          if (fileBytes != null) {
+            final digest = sha256.convert(fileBytes);
+            setState(() {
+              _fileHash = '0x${digest.toString()}';
+            });
+            
+            // Add to audit trail
+            _addToAuditTrail('FILE_HASH_COMPUTED', {
+              'fileName': result.files.single.name,
+              'hash': _fileHash
+            });
+          }
         }
       }
     } catch (e) {
       setState(() {
         _errorMessage = 'Error picking file: ${e.toString()}';
       });
+      
+      // Add to audit trail
+      _addToAuditTrail('ERROR', {
+        'action': 'FILE_PICK',
+        'error': e.toString()
+      });
     }
+  }
+
+  void _addToAuditTrail(String action, Map<String, dynamic> data) {
+    setState(() {
+      _auditTrail.add({
+        'timestamp': DateTime.now().toIso8601String(),
+        'action': action,
+        'walletAddress': _walletAddress.isNotEmpty ? _walletAddress : 'Not connected',
+        'data': data
+      });
+    });
   }
 
   // Helper method to get chain ID based on RPC URL
@@ -306,16 +349,42 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       // Get the appropriate chain ID based on the RPC URL
       final chainId = _getChainId();
 
-      // Use empty string for metadata instead of _metadataUrl
+      // Create metadata JSON to store on-chain
+      String metadataJson = '';
+      
+      if (_documentMetadata != null) {
+        metadataJson = _documentMetadata!.toJsonString();
+      } else {
+        // Create basic metadata if extraction didn't work
+        final basicMetadata = {
+          'fileName': _selectedFile?.files.single.name ?? 'Unknown',
+          'fileSize': _selectedFile?.files.single.size.toString() ?? 'Unknown',
+          'registeredAt': DateTime.now().toIso8601String(),
+          'registeredBy': _walletAddress,
+        };
+        metadataJson = jsonEncode(basicMetadata);
+      }
+
+      _addToAuditTrail('REGISTER_DOCUMENT_ATTEMPT', {
+        'hash': _fileHash,
+        'metadata': metadataJson.substring(0, metadataJson.length > 100 ? 100 : metadataJson.length) + '...',
+        'chainId': chainId,
+      });
+
       final result = await _ethClient!.sendTransaction(
         credentials,
         Transaction.callContract(
           contract: _contract!,
           function: registerFunction,
-          parameters: [hashBytes, ''], // Empty string instead of _metadataUrl
+          parameters: [hashBytes, metadataJson],
         ),
         chainId: chainId,
       );
+
+      _addToAuditTrail('DOCUMENT_REGISTERED', {
+        'hash': _fileHash,
+        'txHash': result,
+      });
 
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Document registered successfully. Transaction: ${result.substring(0, 10)}...')),
@@ -323,6 +392,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     } catch (e) {
       setState(() {
         _errorMessage = 'Error registering document: ${e.toString()}';
+      });
+      
+      _addToAuditTrail('REGISTER_DOCUMENT_ERROR', {
+        'hash': _fileHash,
+        'error': e.toString(),
       });
     } finally {
       setState(() => _isLoading = false);
@@ -343,6 +417,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       // Convert hash from hex string to bytes32
       final hashBytes = hexToBytes(_fileHash);
 
+      _addToAuditTrail('VERIFY_DOCUMENT_ATTEMPT', {
+        'hash': _fileHash,
+      });
+
       // Use the correct function name from the updated ABI
       final getDocumentFunction = _contract!.function('getDocumentInfo');
 
@@ -352,62 +430,252 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         params: [hashBytes],
       );
 
-      if (response.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Document not found or not registered')),
-        );
-        setState(() => _isLoading = false);
-        return;
-      }
+      _addToAuditTrail('DOCUMENT_VERIFIED', {
+        'hash': _fileHash,
+        'found': true,
+        'status': _getStatusString(response[2]),
+      });
 
-      // Convert status code to text
-      String statusText = 'Unknown';
-      switch (response[2].toInt()) {
-        case 0:
-          statusText = 'Pending';
-          break;
-        case 1:
-          statusText = 'Verified';
-          break;
-        case 2:
-          statusText = 'Rejected';
-          break;
+      // Parse status to user-friendly string
+      final statusString = _getStatusString(response[2]);
+      final statusColor = _getStatusColor(response[2]);
+      final statusCode = response[2] is BigInt ? (response[2] as BigInt).toInt() : response[2] as int;
+      
+      // Parse metadata
+      String metadataJson = response[0];
+      Map<String, dynamic> metadata = {};
+      
+      try {
+        if (metadataJson.isNotEmpty) {
+          metadata = jsonDecode(metadataJson);
+        }
+      } catch (e) {
+        // If we can't parse the metadata, just use the raw string
+        metadata = {'raw': metadataJson};
       }
+      
+      // Format timestamp
+      String timestamp = '';
+      try {
+        final timestampInt = (response[3] as BigInt).toInt() * 1000;
+        final date = DateTime.fromMillisecondsSinceEpoch(timestampInt);
+        timestamp = DateFormat('yyyy-MM-dd HH:mm:ss').format(date);
+      } catch (e) {
+        timestamp = response[3].toString();
+      }
+      
+      // Check if user is authorized verifier
+      final isAuthorizedVerifier = await _isAuthorizedVerifier();
 
-      // Show document info
+      // Show detailed verification dialog
       showDialog(
         context: context,
         builder: (context) => AlertDialog(
-          title: const Text('Document Verification'),
+          backgroundColor: Colors.grey[850],
+          title: const Text(
+            'Document Verification',
+            style: TextStyle(color: Colors.white),
+          ),
           content: SingleChildScrollView(
             child: Column(
-              mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
               children: [
-                Text('Status: $statusText'),
-                const SizedBox(height: 8),
-                Text('Owner: ', style: TextStyle(fontWeight: FontWeight.bold)),
-                SelectableText(
-                  '${response[1].toString()}',
-                  style: TextStyle(fontFamily: 'monospace', fontSize: 12),
+                Row(
+                  children: [
+                    Text(
+                      'Status: ',
+                      style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white),
+                    ),
+                    Container(
+                      padding: EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: statusColor,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        statusString,
+                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 8),
-                Text('Metadata: ', style: TextStyle(fontWeight: FontWeight.bold)),
-                SelectableText(
-                  '${response[0]}',
-                  style: TextStyle(fontFamily: 'monospace', fontSize: 12),
-                ),
-                const SizedBox(height: 8),
+                const SizedBox(height: 16),
                 Text(
-                  'Timestamp: ${DateTime.fromMillisecondsSinceEpoch((response[3] as BigInt).toInt() * 1000).toString()}',
+                  'Owner:',
+                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white),
                 ),
+                Text(
+                  '${(response[1] as EthereumAddress).hex}',
+                  style: TextStyle(fontFamily: 'monospace', color: Colors.white70),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Metadata:',
+                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white),
+                ),
+                const SizedBox(height: 8),
+                Container(
+                  padding: EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Colors.black38,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: _buildMetadataWidgets(metadata),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  'Timestamp:',
+                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white),
+                ),
+                Text(
+                  timestamp,
+                  style: TextStyle(color: Colors.white70),
+                ),
+                // Check for verification audit
+                const SizedBox(height: 16),
+                FutureBuilder<int>(
+                  future: _getVerifierCount(hashBytes),
+                  builder: (context, snapshot) {
+                    if (snapshot.connectionState == ConnectionState.waiting) {
+                      return CircularProgressIndicator();
+                    }
+                    
+                    if (snapshot.hasError || !snapshot.hasData) {
+                      return Text(
+                        'Could not load verification audit trail',
+                        style: TextStyle(color: Colors.red),
+                      );
+                    }
+                    
+                    final verifierCount = snapshot.data!;
+                    
+                    if (verifierCount == 0) {
+                      return Text(
+                        'No verifications recorded yet',
+                        style: TextStyle(fontStyle: FontStyle.italic, color: Colors.white70),
+                      );
+                    }
+                    
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Verification Trail:',
+                          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white),
+                        ),
+                        Text(
+                          '$verifierCount address(es) have verified this document',
+                          style: TextStyle(color: Colors.white70),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+                
+                // Add status update UI for authorized verifiers
+                if (isAuthorizedVerifier && statusCode == 0) ...[
+                  const SizedBox(height: 24),
+                  const Divider(color: Colors.grey),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Update Document Status:',
+                    style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                    children: [
+                      ElevatedButton.icon(
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                          _updateDocumentStatus(hashBytes, 1); // 1 = Verified
+                        },
+                        icon: Icon(Icons.check_circle, color: Colors.white),
+                        label: Text('Verify'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green,
+                          foregroundColor: Colors.white,
+                          padding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        ),
+                      ),
+                      ElevatedButton.icon(
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                          _updateDocumentStatus(hashBytes, 2); // 2 = Rejected
+                        },
+                        icon: Icon(Icons.cancel, color: Colors.white),
+                        label: Text('Reject'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.red,
+                          foregroundColor: Colors.white,
+                          padding: EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+                
+                // Show message if already verified or rejected
+                if (isAuthorizedVerifier && statusCode > 0) ...[
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: statusCode == 1 ? Colors.green.withOpacity(0.2) : Colors.red.withOpacity(0.2),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          statusCode == 1 ? Icons.check_circle : Icons.cancel,
+                          color: statusCode == 1 ? Colors.green : Colors.red,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'This document has already been ${statusCode == 1 ? 'verified' : 'rejected'}',
+                            style: TextStyle(color: Colors.white),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+                
+                // Show message for non-verifiers
+                if (!isAuthorizedVerifier) ...[
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Colors.grey.withOpacity(0.2),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(Icons.info, color: Colors.blue),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'You are not authorized to change document status',
+                            style: TextStyle(color: Colors.white70),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Close'),
+              child: const Text('Close', style: TextStyle(color: Colors.blue)),
             ),
           ],
         ),
@@ -416,11 +684,110 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       setState(() {
         _errorMessage = 'Error verifying document: ${e.toString()}';
       });
+      
+      _addToAuditTrail('VERIFY_DOCUMENT_ERROR', {
+        'hash': _fileHash,
+        'error': e.toString(),
+      });
     } finally {
       setState(() => _isLoading = false);
     }
   }
-
+  
+  String _getStatusString(dynamic status) {
+    if (status is BigInt) {
+      switch (status.toInt()) {
+        case 0:
+          return 'Pending';
+        case 1:
+          return 'Verified';
+        case 2:
+          return 'Rejected';
+        default:
+          return 'Unknown';
+      }
+    } else if (status is int) {
+      switch (status) {
+        case 0:
+          return 'Pending';
+        case 1:
+          return 'Verified';
+        case 2:
+          return 'Rejected';
+        default:
+          return 'Unknown';
+      }
+    }
+    return 'Unknown';
+  }
+  
+  Color _getStatusColor(dynamic status) {
+    int statusCode = -1;
+    
+    if (status is BigInt) {
+      statusCode = status.toInt();
+    } else if (status is int) {
+      statusCode = status;
+    }
+    
+    switch (statusCode) {
+      case 0:
+        return Colors.orange; // Pending
+      case 1:
+        return Colors.green; // Verified
+      case 2:
+        return Colors.red; // Rejected
+      default:
+        return Colors.grey; // Unknown
+    }
+  }
+  
+  List<Widget> _buildMetadataWidgets(Map<String, dynamic> metadata) {
+    List<Widget> widgets = [];
+    
+    metadata.forEach((key, value) {
+      // If value is a nested object, format it properly
+      var displayValue = value;
+      if (value is Map) {
+        displayValue = json.encode(value);
+      } else if (value is List) {
+        displayValue = json.encode(value);
+      }
+      
+      widgets.add(
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 2),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '$key: ',
+                style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue[200]),
+              ),
+              Expanded(
+                child: Text(
+                  '$displayValue',
+                  style: TextStyle(color: Colors.white),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    });
+    
+    if (widgets.isEmpty) {
+      widgets.add(
+        Text(
+          'No metadata available',
+          style: TextStyle(fontStyle: FontStyle.italic, color: Colors.white70),
+        ),
+      );
+    }
+    
+    return widgets;
+  }
+  
   // Helper function to convert hex string to bytes32
   Uint8List hexToBytes(String hex) {
     // Remove '0x' prefix if present
@@ -436,6 +803,124 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     }
 
     return Uint8List.fromList(result);
+  }
+
+  Future<int> _getVerifierCount(Uint8List hashBytes) async {
+    try {
+      final countFunction = _contract!.function('getVerifierCount');
+      final result = await _ethClient!.call(
+        contract: _contract!,
+        function: countFunction,
+        params: [hashBytes],
+      );
+      
+      if (result.isNotEmpty && result[0] is BigInt) {
+        return (result[0] as BigInt).toInt();
+      }
+      return 0;
+    } catch (e) {
+      print('Error getting verifier count: $e');
+      return 0;
+    }
+  }
+
+  // Add function to check if user is authorized verifier
+  Future<bool> _isAuthorizedVerifier() async {
+    if (!_isConnected || _ethClient == null || _contract == null) {
+      return false;
+    }
+    
+    try {
+      // Get current wallet address as EthereumAddress
+      final walletAddress = EthereumAddress.fromHex(_walletAddress);
+      
+      // Call the authorized verifiers mapping
+      final verifierFunction = _contract!.function('authorizedVerifiers');
+      final response = await _ethClient!.call(
+        contract: _contract!,
+        function: verifierFunction,
+        params: [walletAddress],
+      );
+      
+      // Also check if the current user is the contract owner
+      final ownerFunction = _contract!.function('owner');
+      final ownerResponse = await _ethClient!.call(
+        contract: _contract!,
+        function: ownerFunction,
+        params: [],
+      );
+      
+      final isOwner = (ownerResponse[0] as EthereumAddress).hex.toLowerCase() == _walletAddress.toLowerCase();
+      
+      // Return true if user is either owner or authorized verifier
+      return isOwner || (response[0] as bool);
+    } catch (e) {
+      print('Error checking verifier status: $e');
+      return false;
+    }
+  }
+  
+  // Add function to update document status
+  Future<void> _updateDocumentStatus(Uint8List hashBytes, int newStatus) async {
+    setState(() => _isLoading = true);
+    
+    try {
+      // Remove '0x' prefix if present to prevent double prefixing
+      final cleanPrivateKey = _privateKey.startsWith('0x')
+          ? _privateKey.substring(2)
+          : _privateKey;
+      
+      final credentials = EthPrivateKey.fromHex(cleanPrivateKey);
+      
+      // Call updateDocumentStatus function from contract
+      final updateFunction = _contract!.function('updateDocumentStatus');
+      
+      // Get the appropriate chain ID based on the RPC URL
+      final chainId = _getChainId();
+      
+      _addToAuditTrail('UPDATE_DOCUMENT_STATUS_ATTEMPT', {
+        'hash': _fileHash,
+        'newStatus': newStatus == 1 ? 'Verified' : 'Rejected',
+      });
+      
+      final result = await _ethClient!.sendTransaction(
+        credentials,
+        Transaction.callContract(
+          contract: _contract!,
+          function: updateFunction,
+          parameters: [hashBytes, BigInt.from(newStatus)],
+        ),
+        chainId: chainId,
+      );
+      
+      _addToAuditTrail('DOCUMENT_STATUS_UPDATED', {
+        'hash': _fileHash,
+        'newStatus': newStatus == 1 ? 'Verified' : 'Rejected',
+        'txHash': result,
+      });
+      
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Document ${newStatus == 1 ? 'verified' : 'rejected'} successfully!'),
+          backgroundColor: newStatus == 1 ? Colors.green : Colors.red,
+        ),
+      );
+      
+      // Re-verify document to show updated status
+      _verifyDocument();
+    } catch (e) {
+      setState(() {
+        _errorMessage = 'Error updating document status: ${e.toString()}';
+      });
+      
+      _addToAuditTrail('UPDATE_DOCUMENT_STATUS_ERROR', {
+        'hash': _fileHash,
+        'newStatus': newStatus == 1 ? 'Verified' : 'Rejected',
+        'error': e.toString(),
+      });
+    } finally {
+      setState(() => _isLoading = false);
+    }
   }
 
   Widget _buildWalletForm() {

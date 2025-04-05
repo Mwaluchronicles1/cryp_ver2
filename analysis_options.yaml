@@ -26,3 +26,12 @@ linter:
 
 # Additional information about this file can be found at
 # https://dart.dev/guides/language/analysis-options
+
+# Additional configuration to suppress plugin warnings
+analyzer:
+  errors:
+    deprecated_member_use: ignore
+    plugin_platforms_must_support_android: ignore
+    plugin_platforms_must_support_ios: ignore
+    plugin_implements_references_default_interface: ignore
+    plugin_references_default_implementation: ignore
