@@ -1,0 +1,40 @@
+{
+  "_format": "hh-sol-cache-2",
+  "files": {
+    "C:\\Users\\jacka\\StudioProjects\\cryp_pro_ver2\\blockchain\\contracts\\DocumentVerification.sol": {
+      "lastModificationDate": 1743727659443,
+      "contentHash": "3adb57e640cd12f22c3fa13192813d02",
+      "sourceName": "contracts/DocumentVerification.sol",
+      "solcConfig": {
+        "version": "0.8.19",
+        "settings": {
+          "optimizer": {
+            "enabled": true,
+            "runs": 200
+          },
+          "outputSelection": {
+            "*": {
+              "*": [
+                "abi",
+                "evm.bytecode",
+                "evm.deployedBytecode",
+                "evm.methodIdentifiers",
+                "metadata"
+              ],
+              "": [
+                "ast"
+              ]
+            }
+          }
+        }
+      },
+      "imports": [],
+      "versionPragmas": [
+        "^0.8.19"
+      ],
+      "artifacts": [
+        "DocumentVerification"
+      ]
+    }
+  }
+}
